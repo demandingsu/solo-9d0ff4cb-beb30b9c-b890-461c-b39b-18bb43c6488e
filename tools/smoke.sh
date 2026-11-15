@@ -34,6 +34,37 @@ curl -sf -o /tmp/smoke_r1.gz "$BASE/jobs/$ID/download/r1"
 curl -sf -o /tmp/smoke_r2.gz "$BASE/jobs/$ID/download/r2"
 python3 -c "import gzip;print('# downloaded R1 has', gzip.open('/tmp/smoke_r1.gz').read().count(b'\n')//4, 'records')"
 
+echo "# de-identified export of the successful job (expect 4 pairs)"
+EXPORT="$(curl -sf -X POST "$BASE/jobs/$ID/exports")"
+EID="$(python3 -c 'import json,sys;print(json.load(sys.stdin)["export_id"])' <<<"$EXPORT")"
+for _ in $(seq 1 100); do
+  BODY="$(curl -sf "$BASE/exports/$EID")"
+  STATUS="$(python3 -c 'import json,sys;print(json.load(sys.stdin)["status"])' <<<"$BODY")"
+  case "$STATUS" in succeeded|failed|stopped) break ;; esac
+  sleep 0.1
+done
+python3 -m json.tool <<<"$BODY"
+curl -sf -o /tmp/smoke_export_r1.gz "$BASE/exports/$EID/download/r1"
+curl -sf -o /tmp/smoke_export_r2.gz "$BASE/exports/$EID/download/r2"
+python3 - <<'PY'
+import gzip
+r1 = gzip.open('/tmp/smoke_export_r1.gz').read()
+r2 = gzip.open('/tmp/smoke_export_r2.gz').read()
+records = r1.count(b'\n') // 4
+old = gzip.open('/tmp/smoke_r1.gz').read()
+old_names = {line[1:].split()[0].rsplit(b'/', 1)[0] for line in old.splitlines()[0::4]}
+new_names = {line[1:].split()[0].rsplit(b'/', 1)[0] for line in r1.splitlines()[0::4]}
+print('# export R1 records:', records)
+print('# export ids unique:', len(new_names))
+print('# original names leaked:', any(name in r1 or name in r2 for name in old_names))
+PY
+
+echo "# export of a failed job must be rejected (expect 409)"
+JOB="$(submit "$ROOT/samples/truncated_R1.fastq.gz" "$ROOT/samples/truncated_R2.fastq.gz" 20)"
+ID="$(python3 -c 'import json,sys;print(json.load(sys.stdin)["job_id"])' <<<"$JOB")"
+wait_job "$ID" >/dev/null
+echo "# export status: $(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/jobs/$ID/exports")"
+
 echo "# truncated sample (expect failed gzip_corrupt, no download)"
 JOB="$(submit "$ROOT/samples/truncated_R1.fastq.gz" "$ROOT/samples/truncated_R2.fastq.gz" 20)"
 ID="$(python3 -c 'import json,sys;print(json.load(sys.stdin)["job_id"])' <<<"$JOB")"

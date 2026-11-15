@@ -9,8 +9,14 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse
+from pydantic import BaseModel, Field
 
 from . import __version__
+from .export import (
+    ExportConflict,
+    ExportManager,
+    ExportNotFound,
+)
 from .jobs import (
     JobConflict,
     JobManager,
@@ -29,6 +35,18 @@ MAX_UPLOAD_BYTES = int(
 
 def _manager(request: Request) -> JobManager:
     return request.app.state.manager
+
+
+def _exports(request: Request) -> ExportManager:
+    return request.app.state.exports
+
+
+class ExportRequest(BaseModel):
+    job_id: str = Field(
+        ...,
+        min_length=1,
+        description="Job id of a successfully completed QC job",
+    )
 
 
 async def _save_upload(
@@ -103,10 +121,13 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         manager = JobManager(resolved_data_dir)
+        exports = ExportManager(resolved_data_dir)
         app.state.manager = manager
+        app.state.exports = exports
         try:
             yield
         finally:
+            exports.shutdown()
             manager.shutdown()
 
     app = FastAPI(
@@ -119,6 +140,15 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
             "ends has quality at least the threshold; otherwise the whole "
             "pair is discarded. Pair order is preserved.\n\n"
             "A job can be polled, stopped, and (after successful completion "
+            "only) downloaded.\n\n"
+            "For a successfully completed QC job, a de-identified export can "
+            "be submitted: it streams the published results again, replaces "
+            "every read name with a new generated identifier (same identifier "
+            "for both ends, with `/1` and `/2` suffixes), drops original "
+            "header comments and `+` line annotations, and keeps sequence "
+            "and quality unchanged. The server keeps an internal read-level "
+            "mapping table under its data directory; the export API never "
+            "serves it. Exports can be polled, stopped, and (after success "
             "only) downloaded."
         ),
         lifespan=lifespan,
@@ -252,6 +282,156 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
             (r1_path, "R1.kept.fastq.gz")
             if side == "r1"
             else (r2_path, "R2.kept.fastq.gz")
+        )
+        return FileResponse(
+            path,
+            media_type="application/gzip",
+            filename=filename,
+        )
+
+    # -- de-identified exports ------------------------------------------
+    @app.post(
+        "/jobs/{job_id}/exports",
+        status_code=202,
+        tags=["exports"],
+        summary="Start a de-identified export of a successful QC job",
+        responses={
+            202: {"description": "Export accepted and queued"},
+            404: {"description": "Unknown job or export"},
+            409: {"description": "Job not successfully completed"},
+        },
+    )
+    async def create_export(request: Request, job_id: str) -> dict:
+        try:
+            source_r1, source_r2 = _manager(request).output_paths(job_id)
+        except JobNotFound:
+            raise HTTPException(
+                status_code=404, detail=f"job {job_id!r} not found"
+            ) from None
+        except JobConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.message) from None
+
+        exports = _exports(request)
+        export = exports.create_export(job_id, source_r1, source_r2)
+        try:
+            exports.start(export.export_id)
+        except Exception:
+            exports.abort(export.export_id)
+            raise
+        return exports.snapshot(export.export_id)
+
+    @app.post(
+        "/exports",
+        status_code=202,
+        tags=["exports"],
+        summary="Start a de-identified export by body-provided job id",
+        responses={
+            202: {"description": "Export accepted and queued"},
+            404: {"description": "Unknown job"},
+            409: {"description": "Job not successfully completed"},
+            422: {"description": "Missing or invalid job_id"},
+        },
+    )
+    async def create_export_from_body(
+        request: Request, payload: ExportRequest
+    ) -> dict:
+        return await create_export(request, payload.job_id)
+
+    @app.get(
+        "/exports",
+        tags=["exports"],
+        summary="List all exports (newest first)",
+    )
+    async def list_exports(request: Request) -> dict:
+        return {
+            "exports": [
+                export.to_dict()
+                for export in _exports(request).list_exports()
+            ]
+        }
+
+    @app.get(
+        "/jobs/{job_id}/exports",
+        tags=["exports"],
+        summary="List exports started from a job (newest first)",
+        responses={404: {"description": "Unknown job"}},
+    )
+    async def list_job_exports(request: Request, job_id: str) -> dict:
+        try:
+            _manager(request).get(job_id)
+        except JobNotFound:
+            raise HTTPException(
+                status_code=404, detail=f"job {job_id!r} not found"
+            ) from None
+        return {
+            "exports": [
+                export.to_dict()
+                for export in _exports(request).list_exports(job_id)
+            ]
+        }
+
+    @app.get(
+        "/exports/{export_id}",
+        tags=["exports"],
+        summary="Get export status and exported pair count",
+        responses={404: {"description": "Unknown export"}},
+    )
+    async def get_export(request: Request, export_id: str) -> dict:
+        try:
+            return _exports(request).snapshot(export_id)
+        except ExportNotFound:
+            raise HTTPException(
+                status_code=404, detail=f"export {export_id!r} not found"
+            ) from None
+
+    @app.post(
+        "/exports/{export_id}/stop",
+        tags=["exports"],
+        summary="Request export cancellation",
+        responses={
+            404: {"description": "Unknown export"},
+            409: {"description": "Export already finished"},
+        },
+    )
+    async def stop_export(request: Request, export_id: str) -> dict:
+        try:
+            return _exports(request).request_stop(export_id)
+        except ExportNotFound:
+            raise HTTPException(
+                status_code=404, detail=f"export {export_id!r} not found"
+            ) from None
+        except ExportConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.message) from None
+
+    @app.get(
+        "/exports/{export_id}/download/{side}",
+        tags=["exports"],
+        summary="Download a de-identified gzip file (successful exports only)",
+        response_class=FileResponse,
+        responses={
+            404: {"description": "Unknown export"},
+            409: {"description": "Export not successfully completed"},
+        },
+    )
+    async def download_export(
+        request: Request, export_id: str, side: str
+    ) -> FileResponse:
+        if side not in {"r1", "r2"}:
+            raise HTTPException(
+                status_code=404, detail="side must be 'r1' or 'r2'"
+            )
+        try:
+            r1_path, r2_path = _exports(request).output_paths(export_id)
+        except ExportNotFound:
+            raise HTTPException(
+                status_code=404, detail=f"export {export_id!r} not found"
+            ) from None
+        except ExportConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.message) from None
+        path, filename = (
+            (r1_path, "R1.deidentified.fastq.gz")
+            if side == "r1"
+            else (r2_path, "R2.deidentified.fastq.gz")
         )
         return FileResponse(
             path,
